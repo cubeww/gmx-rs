@@ -1,0 +1,15 @@
+[package]
+name = "gmx-rs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gmx"
+path = "src/main.rs"
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+md-5 = "0.10.6"
+quick-xml = { version = "0.41.0", features = ["encoding"] }
+rayon = "1.12.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
