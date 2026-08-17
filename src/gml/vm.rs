@@ -238,6 +238,18 @@ impl VmBuffer {
         );
     }
 
+    /// Emits the `pop.e.v` stack shuffle used by the 1.4 VM when an indexed
+    /// or stack-addressed increment must also leave its expression result on
+    /// the stack. The depth is five for an array address and six for a plain
+    /// stack-instance member address.
+    pub fn emit_pop_reorder(&mut self, depth: u16) {
+        debug_assert!(matches!(depth, 5 | 6));
+        self.write_u32(
+            encode_instruction_arg(Opcode::Pop, encode_types(VmType::Error, VmType::Variable))
+                | u32::from(depth),
+        );
+    }
+
     pub fn emit_push_immediate(&mut self, value: i16) {
         self.write_u32(
             encode_instruction_arg(Opcode::PushImmediate, VmType::Error as u8)
@@ -462,5 +474,16 @@ mod tests {
         vm.emit_push_string("hello").unwrap();
         assert_eq!(vm.function_references[0].offset, 4);
         assert_eq!(vm.string_references[0].offset, 12);
+    }
+
+    #[test]
+    fn encodes_increment_result_stack_reorders() {
+        let mut vm = VmBuffer::new();
+        vm.emit_pop_reorder(5);
+        vm.emit_pop_reorder(6);
+        assert_eq!(
+            vm.bytes(),
+            &[0x05, 0x00, 0x5f, 0x45, 0x06, 0x00, 0x5f, 0x45]
+        );
     }
 }

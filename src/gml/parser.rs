@@ -596,6 +596,9 @@ impl Parser {
                     };
                 }
                 TokenKind::Increment | TokenKind::Decrement => {
+                    if !postfix_target(&value) {
+                        break;
+                    }
                     let token = self.advance();
                     let op = if token.kind == TokenKind::Increment {
                         PostfixOp::Increment
@@ -730,6 +733,13 @@ fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         },
         span,
     }
+}
+
+fn postfix_target(expression: &Expr) -> bool {
+    matches!(
+        expression.kind,
+        ExprKind::Identifier | ExprKind::Index { .. } | ExprKind::Member { .. }
+    )
 }
 
 fn token_name(kind: TokenKind) -> &'static str {
@@ -869,6 +879,31 @@ mod tests {
                 op: BinaryOp::Equal,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn keeps_prefix_increment_after_a_semicolonless_literal_assignment() {
+        let program = parse("a = 1\n++a").unwrap();
+
+        assert_eq!(program.statements.len(), 2);
+        let StmtKind::Expr(Expr {
+            kind: ExprKind::Assign { value, .. },
+            ..
+        }) = &program.statements[0].kind
+        else {
+            panic!("first statement should be an assignment");
+        };
+        assert!(matches!(value.kind, ExprKind::Number));
+        assert!(matches!(
+            program.statements[1].kind,
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Unary {
+                    op: UnaryOp::PreIncrement,
+                    ..
+                },
+                ..
+            })
         ));
     }
 

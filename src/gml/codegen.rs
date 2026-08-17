@@ -1576,11 +1576,24 @@ impl<'a> Compiler<'a> {
             || spec.implicit_array
             || !matches!(spec.address, VariableAddress::Simple { .. })
         {
-            self.error(
-                target.span,
-                "array/member increment lowering is not implemented yet",
+            let indexed = !indices.is_empty() || spec.implicit_array;
+            self.prepare_stack_address(&spec, indices);
+            self.vm
+                .emit_dup(if indexed { VmType::Long } else { VmType::Int }, 1);
+            self.emit_stack_push(&spec, indices);
+            if keep && !prefix {
+                self.duplicate_stack_increment_result(indexed);
+            }
+            self.vm.emit_push_error(1);
+            self.vm.emit_types(
+                if increment { Opcode::Add } else { Opcode::Sub },
+                VmType::Int,
+                VmType::Variable,
             );
-            self.emit_spec_push(&spec, false);
+            if keep && prefix {
+                self.duplicate_stack_increment_result(indexed);
+            }
+            self.emit_stack_pop(&spec, indices, VmType::Variable, true);
             return VmType::Variable;
         }
         self.emit_spec_push(&spec, false);
@@ -1598,6 +1611,11 @@ impl<'a> Compiler<'a> {
         }
         self.emit_spec_pop(&spec, VmType::Variable, false);
         VmType::Variable
+    }
+
+    fn duplicate_stack_increment_result(&mut self, indexed: bool) {
+        self.vm.emit_dup(VmType::Variable, 1);
+        self.vm.emit_pop_reorder(if indexed { 5 } else { 6 });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2703,6 +2721,92 @@ mod tests {
         assert_eq!(generated.codes[0].local_count, 2);
         assert_eq!(generated.codes[0].locals.len(), 2);
         assert_eq!(generated.codes[0].locals[1].name, "$$$$temp$$$$");
+    }
+
+    #[test]
+    fn compiles_array_and_dynamic_member_increment_statements() {
+        compile_source(
+            "vm-increment-statements",
+            "a[0]++; --a[1]; holder.value++; --holder.value;",
+        );
+    }
+
+    #[test]
+    fn compiles_prefix_increment_after_semicolonless_literal_assignments() {
+        compile_source(
+            "vm-prefix-after-assignment",
+            "a = 1\n++a\nvalues[0] = 1\n++values[0]",
+        );
+    }
+
+    #[test]
+    fn preserves_prefix_and_postfix_results_for_stack_addressed_increments() {
+        let cases = [
+            ("vm-array-post-inc", "return a[0]++;", 5, Opcode::Add, false),
+            ("vm-array-pre-dec", "return --a[0];", 5, Opcode::Sub, true),
+            (
+                "vm-member-post-dec",
+                "return holder.value--;",
+                6,
+                Opcode::Sub,
+                false,
+            ),
+            (
+                "vm-member-pre-inc",
+                "return ++holder.value;",
+                6,
+                Opcode::Add,
+                true,
+            ),
+        ];
+
+        for (label, source, reorder_depth, arithmetic, prefix) in cases {
+            let compiled = compile_source(label, source);
+            let words = compiled.codes[0]
+                .bytecode
+                .bytes
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let reorder =
+                instruction_word(Opcode::Pop, VmType::Error, VmType::Variable) | reorder_depth;
+            let arithmetic = instruction_word(arithmetic, VmType::Int, VmType::Variable);
+            let reorder_position = words.iter().position(|word| *word == reorder).unwrap();
+            let arithmetic_position = words.iter().position(|word| *word == arithmetic).unwrap();
+
+            assert_eq!(
+                reorder_position > arithmetic_position,
+                prefix,
+                "unexpected increment result ordering for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluates_increment_addresses_once() {
+        let compiled = compile_source(
+            "vm-increment-address-once",
+            "a[irandom(3)]++; instance_find(0, 0).value++;",
+        );
+        let functions = &compiled.codes[0].bytecode.function_references;
+        assert_eq!(
+            functions
+                .iter()
+                .filter(|reference| reference.name == "irandom")
+                .count(),
+            1
+        );
+        assert_eq!(
+            functions
+                .iter()
+                .filter(|reference| reference.name == "instance_find")
+                .count(),
+            1
+        );
+    }
+
+    fn instruction_word(opcode: Opcode, first: VmType, second: VmType) -> u32 {
+        ((opcode as u32) << 24) | ((first as u32 | ((second as u32) << 4)) << 16)
     }
 
     fn compile_source(label: &str, source: &str) -> CompiledProject {
