@@ -92,7 +92,7 @@ impl Symbols {
             let id = symbols.intern(name);
             symbols.info[id.0 as usize].callable = Some(CallableSymbol::BuiltinFunction);
         }
-        for name in builtins::CONSTANTS.lines() {
+        for name in builtins::constant_names() {
             let id = symbols.intern(name);
             symbols.set_value(id, ValueSymbol::BuiltinConstant, 10);
         }
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn runner_tables_have_expected_entries() {
         assert_eq!(builtins::FUNCTIONS.lines().count(), 2733);
-        assert_eq!(builtins::CONSTANTS.lines().count(), 507);
+        assert_eq!(builtins::constant_names().count(), 870);
         assert_eq!(builtins::VARIABLES.lines().count(), 212);
         assert!(
             builtins::FUNCTIONS
@@ -1213,7 +1213,8 @@ mod tests {
                 .lines()
                 .any(|name| name == "audio_play_sound")
         );
-        assert!(builtins::CONSTANTS.lines().any(|name| name == "c_red"));
+        assert!(builtins::constant_names().any(|name| name == "c_red"));
+        assert!(builtins::constant_names().any(|name| name == "vbm_fast"));
         assert!(builtins::VARIABLES.lines().any(|name| name == "room_speed"));
     }
 

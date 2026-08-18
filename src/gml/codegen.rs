@@ -2759,6 +2759,39 @@ mod tests {
     }
 
     #[test]
+    fn compiles_official_compiler_only_constants_as_immediates() {
+        let compiled = compile_source(
+            "vm-compiler-constants",
+            "display_set_windows_vertex_buffer_method(vbm_fast); \
+             display_set_windows_vertex_buffer_method(vbm_compatible); \
+             display_set_windows_vertex_buffer_method(vbm_most_compatible); \
+             vertex_format_add_custom(vertex_type_float4, vertex_usage_position); \
+             gpu_set_zfunc(cmpfunc_always); gpu_set_cullmode(cull_counterclockwise); \
+             return lighttype_point + path_action_reverse + tm_countvsyncs;",
+        );
+        let compiler_only = [
+            "vbm_fast",
+            "vbm_compatible",
+            "vbm_most_compatible",
+            "vertex_type_float4",
+            "vertex_usage_position",
+            "cmpfunc_always",
+            "cull_counterclockwise",
+            "lighttype_point",
+            "path_action_reverse",
+            "tm_countvsyncs",
+        ];
+
+        assert!(
+            compiled.codes[0]
+                .bytecode
+                .variable_references
+                .iter()
+                .all(|reference| !compiler_only.contains(&reference.name.as_str()))
+        );
+    }
+
+    #[test]
     fn preserves_prefix_and_postfix_results_for_stack_addressed_increments() {
         let cases = [
             ("vm-array-post-inc", "return a[0]++;", 5, Opcode::Add, false),

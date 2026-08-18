@@ -3248,6 +3248,10 @@ vk_tab
 vk_up
 ";
 
+pub fn constant_names() -> impl Iterator<Item = &'static str> {
+    CONSTANTS.lines().chain(super::compiler_constants::names())
+}
+
 /// Numeric values registered by the Windows GMS 1.4.9999 runner and compiler.
 /// Compiler-only aliases used by project source are included as well.
 pub fn constant_value(name: &str) -> Option<f64> {
@@ -3759,7 +3763,7 @@ pub fn constant_value(name: &str) -> Option<f64> {
         "vk_subtract" => 109.0,
         "vk_tab" => 9.0,
         "vk_up" => 38.0,
-        _ => return None,
+        _ => return super::compiler_constants::value(name),
     };
     Some(value)
 }
@@ -4112,4 +4116,25 @@ pub fn is_instance_variable(name: &str) -> bool {
             | "yprevious"
             | "ystart"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn constant_registry_has_unique_names_and_values() {
+        let names = constant_names().collect::<Vec<_>>();
+        let unique = names.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(names.len(), unique.len());
+        for name in names {
+            assert!(
+                constant_value(name).is_some(),
+                "built-in constant {name} has no numeric value"
+            );
+        }
+    }
 }

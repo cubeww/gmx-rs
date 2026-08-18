@@ -3,6 +3,7 @@ mod builtins;
 mod chunks;
 mod classifications;
 mod codegen;
+mod compiler_constants;
 mod dnd;
 mod lexer;
 mod macros;
