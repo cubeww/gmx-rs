@@ -5,6 +5,7 @@ mod classifications;
 mod codegen;
 mod dnd;
 mod lexer;
+mod macros;
 mod parser;
 mod project;
 mod semantic;

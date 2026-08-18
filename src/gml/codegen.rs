@@ -2740,6 +2740,25 @@ mod tests {
     }
 
     #[test]
+    fn compiles_writable_project_macro_as_its_expanded_global() {
+        let compiled = compile_source_with_constants(
+            "vm-writable-macro",
+            "nsfs_is_available = true; return nsfs_is_available;",
+            &[("nsfs_is_available", "global.g_nsfs_is_available")],
+        );
+        let references = &compiled.codes[0].bytecode.variable_references;
+
+        assert!(references.iter().any(|reference| {
+            reference.name == "g_nsfs_is_available" && reference.kind == VariableKind::Global
+        }));
+        assert!(
+            !references
+                .iter()
+                .any(|reference| reference.name == "nsfs_is_available")
+        );
+    }
+
+    #[test]
     fn preserves_prefix_and_postfix_results_for_stack_addressed_increments() {
         let cases = [
             ("vm-array-post-inc", "return a[0]++;", 5, Opcode::Add, false),
@@ -2810,12 +2829,26 @@ mod tests {
     }
 
     fn compile_source(label: &str, source: &str) -> CompiledProject {
+        compile_source_with_constants(label, source, &[])
+    }
+
+    fn compile_source_with_constants(
+        label: &str,
+        source: &str,
+        constants: &[(&str, &str)],
+    ) -> CompiledProject {
         let root = temp_dir(label);
         fs::create_dir_all(root.join("Configs")).unwrap();
         fs::create_dir_all(root.join("scripts")).unwrap();
+        let constants = constants
+            .iter()
+            .map(|(name, value)| format!("<constant name=\"{name}\">{value}</constant>"))
+            .collect::<String>();
         fs::write(
             root.join("Tiny.project.gmx"),
-            "<assets><scripts><script>scripts\\test.gml</script></scripts><Configs><Config>Configs\\Default</Config></Configs></assets>",
+            format!(
+                "<assets><scripts><script>scripts\\test.gml</script></scripts><constants>{constants}</constants><Configs><Config>Configs\\Default</Config></Configs></assets>"
+            ),
         )
         .unwrap();
         fs::write(

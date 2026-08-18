@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use crate::assets::{Action, Assets, script_parts};
 
+use super::macros::MacroTable;
 use super::{Diagnostic, Program, Stmt, StmtKind, TokenKind, lex, parse};
 use super::{DndContext, DndError};
 
@@ -361,7 +362,7 @@ pub fn action_code(action: &Action) -> Option<Cow<'_, str>> {
 }
 
 pub fn check_assets(assets: &Assets) -> Result<CheckSummary, Vec<CodeDiagnostic>> {
-    let units = collect_code(assets).map_err(|errors| {
+    let mut units = collect_code(assets).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| CodeDiagnostic {
@@ -372,6 +373,10 @@ pub fn check_assets(assets: &Assets) -> Result<CheckSummary, Vec<CodeDiagnostic>
             })
             .collect::<Vec<_>>()
     })?;
+    let macro_errors = expand_code_macros(assets, &mut units);
+    if !macro_errors.is_empty() {
+        return Err(macro_errors);
+    }
     let results: Vec<_> = units
         .par_iter()
         .map(|unit| match parse(&unit.code) {
@@ -408,6 +413,36 @@ pub fn check_assets(assets: &Assets) -> Result<CheckSummary, Vec<CodeDiagnostic>
     } else {
         Err(errors)
     }
+}
+
+pub(crate) fn expand_code_macros<'a>(
+    assets: &'a Assets,
+    units: &mut [CodeUnit<'a>],
+) -> Vec<CodeDiagnostic> {
+    let table = MacroTable::new(&assets.settings.constants);
+    if table.is_empty() {
+        return Vec::new();
+    }
+    let results: Vec<_> = units
+        .par_iter()
+        .map(|unit| table.expand(&unit.code))
+        .collect();
+    let mut errors = Vec::new();
+    for (unit, result) in units.iter_mut().zip(results) {
+        match result {
+            Ok(Some(code)) => unit.code = Cow::Owned(code),
+            Ok(None) => {}
+            Err(diagnostics) => {
+                errors.extend(diagnostics.into_iter().map(|diagnostic| CodeDiagnostic {
+                    kind: unit.kind,
+                    name: unit.name.clone(),
+                    source: unit.source.to_path_buf(),
+                    diagnostic,
+                }))
+            }
+        }
+    }
+    errors
 }
 
 fn push_code<'a>(

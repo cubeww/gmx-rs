@@ -13,6 +13,7 @@ use super::builtins;
 use super::parse;
 use super::project::{
     CheckSummary, CodeDiagnostic, CodeKind, CodeUnit, DndDiagnostic, collect_code,
+    expand_code_macros,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -390,12 +391,19 @@ impl fmt::Display for AnalysisDiagnostic {
 }
 
 pub fn analyze_assets(assets: &Assets) -> Result<ProjectAnalysis<'_>, Vec<AnalysisDiagnostic>> {
-    let units = collect_code(assets).map_err(|errors| {
+    let mut units = collect_code(assets).map_err(|errors| {
         errors
             .into_iter()
             .map(AnalysisDiagnostic::Dnd)
             .collect::<Vec<_>>()
     })?;
+    let macro_errors = expand_code_macros(assets, &mut units);
+    if !macro_errors.is_empty() {
+        return Err(macro_errors
+            .into_iter()
+            .map(AnalysisDiagnostic::Syntax)
+            .collect());
+    }
     let parsed: Vec<_> = units.par_iter().map(|unit| parse(&unit.code)).collect();
     let mut programs = Vec::with_capacity(units.len());
     let mut syntax_errors = Vec::new();
