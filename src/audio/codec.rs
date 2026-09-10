@@ -6,10 +6,9 @@ use oxideav_vorbis::{StreamEncoderConfig, encode_pcm_to_ogg};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use rusty_mp3::{Error as Mp3Error, Mp3Encoder, Mp3EncoderConfig};
-use rusty_vorbis::{
-    Error as VorbisError, VorbisEncoder, VorbisEncoderConfig, quality01_from_vorbis_q,
-};
+use rusty_vorbis::{Error as VorbisError, VorbisEncoder, VorbisEncoderConfig};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
@@ -34,6 +33,65 @@ struct DecodedAudio {
     samples: Vec<f32>,
     sample_rate: u32,
     channels: usize,
+}
+
+pub(super) fn is_runner_compatible_ogg(source: &[u8]) -> bool {
+    if !source.starts_with(b"OggS") {
+        return false;
+    }
+
+    let stream = MediaSourceStream::new(Box::new(Cursor::new(source.to_vec())), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("ogg");
+    let Ok(mut format) = symphonia::default::get_probe().probe(
+        &hint,
+        stream,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    ) else {
+        return false;
+    };
+    let Some(track) = format.default_track(TrackType::Audio) else {
+        return false;
+    };
+    let track_id = track.id;
+    let Some(parameters) = track
+        .codec_params
+        .as_ref()
+        .and_then(|parameters| parameters.audio())
+    else {
+        return false;
+    };
+    if parameters.codec != CODEC_ID_VORBIS {
+        return false;
+    }
+    let Ok(mut decoder) = symphonia::default::get_codecs()
+        .make_audio_decoder(parameters, &AudioDecoderOptions::default())
+    else {
+        return false;
+    };
+
+    loop {
+        let Ok(packet) = format.next_packet() else {
+            return false;
+        };
+        let Some(packet) = packet else {
+            return false;
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let Ok(decoded) = decoder.decode(&packet) else {
+            return false;
+        };
+        let channels = decoded.spec().channels().count();
+        if decoded.spec().rate() == 0 || !matches!(channels, 1 | 2) {
+            return false;
+        }
+        if decoded.samples_interleaved() > 0 {
+            return true;
+        }
+    }
 }
 
 pub(super) fn transcode(
@@ -308,14 +366,13 @@ fn encode_profiled_ogg(
     bit_rate: u32,
     serial: u32,
 ) -> Result<Vec<u8>, String> {
-    let vorbis_q = (bit_rate / 64).min(6) as f64;
     let bitrate_bps = bit_rate
         .checked_mul(1000)
         .and_then(|value| i32::try_from(value).ok())
         .ok_or_else(|| "Vorbis bitrate is too large".to_owned())?;
     let mut encoder = VorbisEncoder::new(VorbisEncoderConfig {
         bitrate_bps,
-        quality: quality01_from_vorbis_q(vorbis_q),
+        quality: vorbis_quality(bit_rate),
     });
     let channels_u16 =
         u16::try_from(channels).map_err(|_| "too many Vorbis channels".to_owned())?;
@@ -395,10 +452,19 @@ fn encode_general_ogg(
         sample_rate,
         u8::try_from(channels).map_err(|_| "too many Vorbis channels".to_owned())?,
     );
-    config.quality = quality01_from_vorbis_q((bit_rate / 64).min(6) as f64);
+    config.quality = vorbis_quality(bit_rate);
     config.serial = serial;
     config.training_iterations = 0;
     encode_pcm_to_ogg(&planar, &config).map_err(|error| format!("Vorbis encoding failed: {error}"))
+}
+
+fn vorbis_quality(bit_rate: u32) -> f32 {
+    // GameMaker's legacy setting advances in 64-kbit/s steps. The pure-Rust
+    // encoders' normalized quality scale is substantially more aggressive
+    // than libvorbis' q scale below about 0.7, so map the useful range onto a
+    // calibrated 0.70..=0.98 interval instead of treating both scales alike.
+    let legacy_step = (bit_rate / 64).min(6) as f32;
+    (0.70 + legacy_step * 0.05).min(0.98)
 }
 
 fn encode_mp3(
@@ -506,6 +572,37 @@ mod tests {
         assert_eq!(decoded_mp3.sample_rate, sample_rate);
         assert_eq!(decoded_mp3.channels, 1);
         assert!(!decoded_mp3.samples.is_empty());
+    }
+
+    #[test]
+    fn recognizes_only_playable_mono_or_stereo_vorbis_streams() {
+        let sample_rate = 44_100;
+        let mono = (0..4096)
+            .map(|index| {
+                (2.0 * std::f32::consts::PI * 440.0 * index as f32 / sample_rate as f32).sin()
+                    * 0.25
+            })
+            .collect::<Vec<_>>();
+        let stereo = mono
+            .iter()
+            .flat_map(|sample| [*sample, *sample])
+            .collect::<Vec<_>>();
+
+        let mono_ogg = encode_ogg(&mono, 1, sample_rate, 192, 1).unwrap();
+        let stereo_ogg = encode_ogg(&stereo, 2, sample_rate, 192, 2).unwrap();
+        assert!(is_runner_compatible_ogg(&mono_ogg));
+        assert!(is_runner_compatible_ogg(&stereo_ogg));
+        assert!(!is_runner_compatible_ogg(b"OggS"));
+        assert!(!is_runner_compatible_ogg(b"RIFFnot-an-ogg-stream"));
+    }
+
+    #[test]
+    fn legacy_bitrate_uses_the_calibrated_vorbis_quality_range() {
+        assert!((vorbis_quality(0) - 0.70).abs() < f32::EPSILON);
+        assert!((vorbis_quality(64) - 0.75).abs() < f32::EPSILON);
+        assert!((vorbis_quality(192) - 0.85).abs() < f32::EPSILON);
+        assert!((vorbis_quality(384) - 0.98).abs() < f32::EPSILON);
+        assert!((vorbis_quality(u32::MAX) - 0.98).abs() < f32::EPSILON);
     }
 
     #[test]

@@ -62,7 +62,8 @@ options, and `gmx --version` for the compiler version.
 
 Audio conversion is built into `gmx`; WAV, MP3, and Ogg Vorbis sources are
 decoded and emitted as the PCM WAV, MP3, or Ogg Vorbis stream required by the
-project settings. Projects containing sounds do not require an external
+project settings. Compatible Ogg Vorbis sources are kept byte-for-byte to avoid
+lossy re-encoding. Projects containing sounds do not require an external
 converter.
 
 GLSL ES shaders targeting the Windows Runner require `HLSLCompiler.exe` and its

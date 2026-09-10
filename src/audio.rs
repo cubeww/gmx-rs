@@ -17,7 +17,7 @@ use crate::wad::{ChunkOptions, ChunkWriter, FourCc, WadBuilder, WriteError};
 mod codec;
 
 const AUDO: FourCc = FourCc::new(*b"AUDO");
-const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-rust-v3\0";
+const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-rust-v4\0";
 const OGG_CRC_TABLE: [u32; 256] = ogg_crc_table();
 
 #[derive(Debug, Clone)]
@@ -302,6 +302,13 @@ fn convert_sound(assets: &Assets, sound: &Sound, cache_root: &Path) -> Result<Ve
     } else {
         AudioFormat::Wav
     };
+
+    // The Windows Runner reads the channel count and sample rate from the
+    // Vorbis stream itself. Preserve compatible source streams instead of
+    // introducing a lossy second encode merely to mirror the project fields.
+    if matches!(format, AudioFormat::Ogg) && codec::is_runner_compatible_ogg(source_data) {
+        return Ok(source_data.to_vec());
+    }
 
     let mut hasher = Md5::new();
     hasher.update(AUDIO_CACHE_SCHEMA);
