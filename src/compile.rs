@@ -1,4 +1,5 @@
 use std::io::{Seek, Write};
+use std::path::Path;
 
 use crate::artifact::{GeneratedFile, merge_generated_files};
 use crate::assets::Assets;
@@ -107,12 +108,23 @@ pub fn write_vm_wad_with_artifacts<W: Write + Seek>(
     compiled: &CompiledProject,
     output: &mut W,
 ) -> Result<BuildOutput, WriteError> {
+    let cache = cache_root(&project.project_file);
+    write_vm_wad_with_artifacts_in(project, assets, options, compiled, &cache, output)
+}
+
+pub fn write_vm_wad_with_artifacts_in<W: Write + Seek>(
+    project: &ProjectManifest,
+    assets: &Assets,
+    options: &BuildOptions,
+    compiled: &CompiledProject,
+    cache: &Path,
+    output: &mut W,
+) -> Result<BuildOutput, WriteError> {
     let mut effective_options = options.clone();
     effective_options.function_classifications |= function_classifications(compiled);
     let strings = StringTable::new();
-    let cache = cache_root(&project.project_file);
-    let textures = TextureData::prepare(assets, &cache)?;
-    let audio = AudioData::prepare(assets, &cache)?;
+    let textures = TextureData::prepare(assets, cache)?;
+    let audio = AudioData::prepare(assets, cache)?;
     let mut external_files = collect_project_files(project, assets)?;
     external_files.extend(audio.external_files()?);
     let external_files = merge_generated_files(external_files)

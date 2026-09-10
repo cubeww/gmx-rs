@@ -56,7 +56,11 @@ impl KnownBuild {
 
 impl BuildCache {
     pub fn from_env(project: &Path, config: &str) -> Option<Self> {
-        build_cache_enabled().then(|| Self::at(cache_root(project).join("build"), project, config))
+        Self::from_env_at(project, config, &cache_root(project))
+    }
+
+    pub fn from_env_at(project: &Path, config: &str, cache_root: &Path) -> Option<Self> {
+        build_cache_enabled().then(|| Self::at(cache_root.join("build"), project, config))
     }
 
     pub fn known_key(&self) -> Result<Option<String>, CacheError> {
@@ -388,14 +392,23 @@ pub fn cache_root(project: &Path) -> PathBuf {
         .unwrap_or_else(|| default_cache_root(project))
 }
 
+pub fn cache_root_for_target(target_directory: &Path) -> PathBuf {
+    env::var_os("GMX_RS_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target_directory.join(".gmx-cache"))
+}
+
 fn default_cache_root(project: &Path) -> PathBuf {
+    default_target_root(project).join(".gmx-cache")
+}
+
+fn default_target_root(project: &Path) -> PathBuf {
     let project = fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
     project
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .join("build")
-        .join(".gmx-cache")
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
@@ -772,13 +785,7 @@ fn add_executable_fingerprint(hasher: &mut Md5) {
 }
 
 fn add_tool_fingerprints(hasher: &mut Md5) {
-    let ffmpeg_names: &[&str] = if cfg!(windows) {
-        &["ffmpeg.exe", "ffmpeg"]
-    } else {
-        &["ffmpeg"]
-    };
     for names in [
-        ffmpeg_names,
         &["HLSLCompiler.exe"] as &[&str],
         &["D3D11ShaderParser.exe"] as &[&str],
     ] {

@@ -1,12 +1,8 @@
 use std::collections::HashSet;
-use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
 
 use md5::{Digest, Md5};
 use rayon::prelude::*;
@@ -16,13 +12,13 @@ use crate::assets::Assets;
 use crate::cache::{cache_enabled, write_atomic};
 use crate::path::gmx_path;
 use crate::resources::Sound;
-use crate::tool::find_tool;
 use crate::wad::{ChunkOptions, ChunkWriter, FourCc, WadBuilder, WriteError};
 
+mod codec;
+
 const AUDO: FourCc = FourCc::new(*b"AUDO");
-const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-v3\0";
+const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-rust-v3\0";
 const OGG_CRC_TABLE: [u32; 256] = ogg_crc_table();
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct SoundMedia {
@@ -65,11 +61,10 @@ impl AudioData {
             });
         }
 
-        let ffmpeg = find_ffmpeg().map_err(|error| invalid_audio(error.to_string()))?;
         let converted = assets
             .sounds
             .par_iter()
-            .map(|sound| convert_sound(assets, sound, &ffmpeg, cache_root))
+            .map(|sound| convert_sound(assets, sound, cache_root))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| invalid_audio(error.to_string()))?;
 
@@ -290,12 +285,7 @@ impl AudioFormat {
     }
 }
 
-fn convert_sound(
-    assets: &Assets,
-    sound: &Sound,
-    ffmpeg: &Path,
-    cache_root: &Path,
-) -> Result<Vec<u8>, AudioError> {
+fn convert_sound(assets: &Assets, sound: &Sound, cache_root: &Path) -> Result<Vec<u8>, AudioError> {
     let source_data =
         assets
             .binary(&sound.audio_source)
@@ -316,8 +306,6 @@ fn convert_sound(
     let mut hasher = Md5::new();
     hasher.update(AUDIO_CACHE_SCHEMA);
     hasher.update(source_data);
-    hasher.update(ffmpeg.as_os_str().to_string_lossy().as_bytes());
-    add_file_fingerprint(&mut hasher, ffmpeg);
     hasher.update([format as u8]);
     hasher.update(sound.bit_rate.to_le_bytes());
     hasher.update(sound.sample_rate.to_le_bytes());
@@ -341,82 +329,41 @@ fn convert_sound(
         return Ok(data);
     }
 
-    let output = TempAudioFile::create(&key, format.extension())?;
-
-    let mut command = Command::new(ffmpeg);
-    command.arg("-y").arg("-i").arg(&sound.audio_source);
-    let channels = if sound.stereo { "2" } else { "1" };
-    match format {
-        AudioFormat::Wav => {
-            command
-                .arg("-ac")
-                .arg(channels)
-                .arg("-ar")
-                .arg(sound.sample_rate.to_string())
-                .arg("-acodec")
-                .arg(if sound.bit_depth == 8 {
-                    "pcm_u8"
-                } else {
-                    "pcm_s16le"
-                });
-        }
-        AudioFormat::Ogg => {
-            command
-                .arg("-acodec")
-                .arg("libvorbis")
-                .arg("-ac")
-                .arg(channels)
-                .arg("-ar")
-                .arg(sound.sample_rate.to_string())
-                .arg("-aq")
-                .arg((sound.bit_rate / 64).min(6).to_string())
-                .arg("-loglevel")
-                .arg("quiet");
-        }
-        AudioFormat::Mp3 => {
-            command
-                .arg("-acodec")
-                .arg("libmp3lame")
-                .arg("-ac")
-                .arg(channels)
-                .arg("-ar")
-                .arg(sound.sample_rate.to_string())
-                .arg("-ab")
-                .arg(format!("{}k", sound.bit_rate));
-        }
-    }
-    let result = command
-        .arg(&output.path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|source| AudioError::Io {
-            path: ffmpeg.to_path_buf(),
-            source,
-        })?;
-    if !result.status.success() {
-        return Err(AudioError::ConversionFailed {
+    let sample_rate =
+        u32::try_from(sound.sample_rate).map_err(|_| AudioError::ConversionFailed {
             sound: sound.name.clone(),
-            status: result.status.code(),
-            output: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
-        });
-    }
-    let mut data = fs::read(&output.path).map_err(|source| AudioError::Io {
-        path: output.path.clone(),
-        source,
+            output: format!("invalid sample rate {}", sound.sample_rate),
+        })?;
+    let bit_rate = u32::try_from(sound.bit_rate).map_err(|_| AudioError::ConversionFailed {
+        sound: sound.name.clone(),
+        output: format!("invalid bit rate {}", sound.bit_rate),
+    })?;
+    let bit_depth = u16::try_from(sound.bit_depth).unwrap_or(16);
+    let mut data = codec::transcode(
+        source_data,
+        &sound.audio_source,
+        codec::TranscodeSettings {
+            format,
+            sample_rate,
+            channels: if sound.stereo { 2 } else { 1 },
+            bit_depth,
+            bit_rate,
+            ogg_serial,
+        },
+    )
+    .map_err(|output| AudioError::ConversionFailed {
+        sound: sound.name.clone(),
+        output,
     })?;
     if data.is_empty() {
         return Err(AudioError::ConversionFailed {
             sound: sound.name.clone(),
-            status: result.status.code(),
-            output: "converter produced an empty file".to_owned(),
+            output: "audio encoder produced an empty file".to_owned(),
         });
     }
     if matches!(format, AudioFormat::Ogg) {
         normalize_ogg(&mut data, ogg_serial).map_err(|message| AudioError::ConversionFailed {
             sound: sound.name.clone(),
-            status: result.status.code(),
             output: message,
         })?;
     }
@@ -424,19 +371,6 @@ fn convert_sound(
         let _ = write_atomic(&path, &data);
     }
     Ok(data)
-}
-
-fn add_file_fingerprint(hasher: &mut Md5, path: &Path) {
-    if let Ok(metadata) = fs::metadata(path) {
-        hasher.update(metadata.len().to_le_bytes());
-        if let Ok(modified) = metadata.modified()
-            && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
-        {
-            hasher.update(duration.as_secs().to_le_bytes());
-            hasher.update(duration.subsec_nanos().to_le_bytes());
-        }
-    }
-    hasher.update([0]);
 }
 
 fn valid_audio_data(data: &[u8], format: AudioFormat) -> bool {
@@ -448,40 +382,6 @@ fn valid_audio_data(data: &[u8], format: AudioFormat) -> bool {
         AudioFormat::Mp3 => {
             data.starts_with(b"ID3") || data.len() >= 2 && data[0] == 0xff && data[1] & 0xe0 == 0xe0
         }
-    }
-}
-
-#[derive(Debug)]
-struct TempAudioFile {
-    path: PathBuf,
-}
-
-impl TempAudioFile {
-    fn create(key: &str, extension: &str) -> Result<Self, AudioError> {
-        let root = env::temp_dir().join("gmx-rs-audio");
-        fs::create_dir_all(&root).map_err(|source| AudioError::Io {
-            path: root.clone(),
-            source,
-        })?;
-        for _ in 0..100 {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = root.join(format!(
-                ".{key}.tmp-{}-{sequence}.{extension}",
-                std::process::id()
-            ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(AudioError::Io { path, source }),
-            }
-        }
-        Err(AudioError::TempFileExhausted { root })
-    }
-}
-
-impl Drop for TempAudioFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -540,15 +440,6 @@ const fn ogg_crc_table() -> [u32; 256] {
     table
 }
 
-fn find_ffmpeg() -> Result<PathBuf, AudioError> {
-    let names: &[&str] = if cfg!(windows) {
-        &["ffmpeg.exe", "ffmpeg"]
-    } else {
-        &["ffmpeg"]
-    };
-    find_tool(names).ok_or(AudioError::MissingConverter)
-}
-
 fn culture_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     left.bytes()
         .map(collation_unit)
@@ -590,29 +481,13 @@ fn invalid_audio(message: impl Into<String>) -> WriteError {
 
 #[derive(Debug)]
 enum AudioError {
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    MissingSource {
-        sound: String,
-        path: PathBuf,
-    },
-    MissingConverter,
-    ConversionFailed {
-        sound: String,
-        status: Option<i32>,
-        output: String,
-    },
-    TempFileExhausted {
-        root: PathBuf,
-    },
+    MissingSource { sound: String, path: PathBuf },
+    ConversionFailed { sound: String, output: String },
 }
 
 impl std::fmt::Display for AudioError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::MissingSource { sound, path } => {
                 write!(
                     formatter,
@@ -620,34 +495,14 @@ impl std::fmt::Display for AudioError {
                     path.display()
                 )
             }
-            Self::MissingConverter => {
-                formatter.write_str("ffmpeg was not found next to gmx or on PATH")
+            Self::ConversionFailed { sound, output } => {
+                write!(formatter, "audio conversion failed for {sound}: {output}")
             }
-            Self::ConversionFailed {
-                sound,
-                status,
-                output,
-            } => write!(
-                formatter,
-                "audio conversion failed for {sound} with status {status:?}: {output}"
-            ),
-            Self::TempFileExhausted { root } => write!(
-                formatter,
-                "could not create a unique audio conversion file under {}",
-                root.display()
-            ),
         }
     }
 }
 
-impl std::error::Error for AudioError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for AudioError {}
 
 #[cfg(test)]
 mod tests {

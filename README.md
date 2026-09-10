@@ -18,26 +18,52 @@ directory as `<project name>.exe`.
 
 ## Usage
 
-Run these commands in a directory containing exactly one `*.project.gmx`:
+`gmx` provides four commands:
 
 ```text
-gmx build    # write build/data.win and runtime files
-gmx run      # build and start the game (Windows only)
-gmx clean    # remove build output and caches
+gmx build [OPTIONS]  # compile data.win and runtime files
+gmx check [OPTIONS]  # check GML and VM bytecode generation
+gmx run [OPTIONS]    # compile and start the game (Windows only)
+gmx clean [OPTIONS]  # remove build output and caches
 ```
 
-An explicit project, output file, and configuration can also be supplied:
+Run them from a directory containing exactly one `*.project.gmx`. The project
+is detected automatically, the `Default` configuration is used, and build
+artifacts are written to `./build`.
+
+All four commands accept an explicit project manifest:
 
 ```text
-gmx build <project.gmx> <data.win> [config]
+--manifest-path <PATH>
 ```
 
-Use `gmx help` to list the inspection, extraction, validation, and diff
-commands.
+`build`, `check`, and `run` accept a GameMaker configuration name:
+
+```text
+--config <NAME>
+```
+
+`build`, `run`, and `clean` can use a different build directory:
+
+```text
+--target-dir <DIRECTORY>
+```
+
+For example:
+
+```text
+gmx build --manifest-path C:\games\Game\Game.project.gmx --target-dir C:\games\Game\build --config Default
+```
+
+Use `gmx --help` for the command list, `gmx help <command>` for command-specific
+options, and `gmx --version` for the compiler version.
 
 ## External tools
 
-Projects containing sounds require `ffmpeg.exe`.
+Audio conversion is built into `gmx`; WAV, MP3, and Ogg Vorbis sources are
+decoded and emitted as the PCM WAV, MP3, or Ogg Vorbis stream required by the
+project settings. Projects containing sounds do not require an external
+converter.
 
 GLSL ES shaders targeting the Windows Runner require `HLSLCompiler.exe` and its
 companion files to generate HLSL9. HLSL11 shaders additionally require
@@ -49,4 +75,4 @@ and their companion files together in a directory on `PATH`.
 ## Cache
 
 Build, audio, and texture caches are stored under
-`build/.gmx-cache/{build,audio,texture}` and are removed by `gmx clean`.
+`<target-dir>/.gmx-cache/{build,audio,texture}` and are removed by `gmx clean`.

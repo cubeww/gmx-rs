@@ -1,32 +1,99 @@
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueHint};
 use gmx_rs::artifact::{GeneratedFile, merge_generated_files, write_generated_files};
 use gmx_rs::assets::Assets;
-use gmx_rs::cache::{BuildCache, build_dependencies};
-use gmx_rs::compile::{BuildOptions, write_vm_wad_with_artifacts};
+use gmx_rs::cache::{BuildCache, build_dependencies, cache_root_for_target};
+use gmx_rs::compile::{BuildOptions, write_vm_wad_with_artifacts_in};
 use gmx_rs::config::Config;
 use gmx_rs::gml::{analyze_assets, compile_vm};
-use gmx_rs::project::{ProjectManifest, ResourceKind};
-use gmx_rs::semantic::diff_wads_semantic;
-use gmx_rs::wad::{WadDiff, WadFile, diff_wads, extract_chunks};
+use gmx_rs::project::ProjectManifest;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "gmx",
+    version,
+    about = "Compile GameMaker: Studio 1.4 GMX projects"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Compile a project and its runtime files.
+    Build(BuildArgs),
+    /// Compile and run a project.
+    Run(BuildArgs),
+    /// Check that a project's GML can be compiled to VM bytecode.
+    Check(ProjectArgs),
+    /// Remove a project's build directory and caches.
+    Clean(CleanArgs),
+}
+
+#[derive(Debug, Args)]
+struct ManifestArgs {
+    /// Path to the project's *.project.gmx manifest.
+    #[arg(long, value_name = "PATH", value_hint = ValueHint::FilePath)]
+    manifest_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ProjectArgs {
+    #[command(flatten)]
+    manifest: ManifestArgs,
+
+    /// GameMaker project configuration to use.
+    #[arg(long, value_name = "NAME", default_value = "Default")]
+    config: String,
+}
+
+#[derive(Debug, Args)]
+struct BuildArgs {
+    #[command(flatten)]
+    project: ProjectArgs,
+
+    /// Directory for data.win, the Runner, external files, and caches.
+    #[arg(long, value_name = "DIRECTORY", value_hint = ValueHint::DirPath)]
+    target_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CleanArgs {
+    #[command(flatten)]
+    manifest: ManifestArgs,
+
+    /// Build directory to remove.
+    #[arg(long, value_name = "DIRECTORY", value_hint = ValueHint::DirPath)]
+    target_dir: Option<PathBuf>,
+}
 
 fn main() -> ExitCode {
-    match run(env::args_os().skip(1)) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(AppError::Usage(message)) => {
-            eprintln!("error: {message}\n");
-            print_usage();
-            ExitCode::from(2)
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let _ = error.print();
+            return ExitCode::from(u8::try_from(exit_code).unwrap_or(1));
         }
+    };
+    let Some(command) = cli.command else {
+        let _ = Cli::command().print_help();
+        println!();
+        return ExitCode::SUCCESS;
+    };
+
+    match run(command) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(AppError::Runtime(error)) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -38,137 +105,29 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), AppError> {
-    let Some(command) = args.next() else {
-        print_usage();
-        return Ok(());
-    };
-
-    match command.to_str() {
-        Some("help" | "-h" | "--help") => {
-            ensure_no_more_args(args)?;
-            print_usage();
-            Ok(())
+fn run(command: CliCommand) -> Result<(), AppError> {
+    match command {
+        CliCommand::Build(args) => {
+            let input = resolve_manifest(args.project.manifest.manifest_path)?;
+            let target = resolve_target_dir(&input, args.target_dir)?;
+            build(&input, &target.join("data.win"), &args.project.config)
         }
-        Some("inspect") => {
-            let input = required_path(&mut args, "data.win path")?;
-            ensure_no_more_args(args)?;
-            inspect(&input)
+        CliCommand::Run(args) => {
+            let input = resolve_manifest(args.project.manifest.manifest_path)?;
+            let target = resolve_target_dir(&input, args.target_dir)?;
+            run_project(&input, &target, &args.project.config)
         }
-        Some("extract") => {
-            let input = required_path(&mut args, "data.win path")?;
-            let output = required_path(&mut args, "output directory")?;
-            ensure_no_more_args(args)?;
-            extract(&input, &output)
+        CliCommand::Check(args) => {
+            let input = resolve_manifest(args.manifest.manifest_path)?;
+            check_project(&input, &args.config)
         }
-        Some("inspect-project") => {
-            let input = required_path(&mut args, "project.gmx path")?;
-            let config = args
-                .next()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Default".to_owned());
-            ensure_no_more_args(args)?;
-            inspect_project(&input, &config)
+        CliCommand::Clean(args) => {
+            let input = resolve_manifest(args.manifest.manifest_path)?;
+            let project_directory = input.parent().unwrap_or_else(|| Path::new("."));
+            let target = resolve_target_dir(&input, args.target_dir)?;
+            clean_project_build(project_directory, &target)
         }
-        Some("build") => {
-            let Some(input) = args.next().map(PathBuf::from) else {
-                let directory = env::current_dir()?;
-                let input = find_project_in(&directory)?;
-                return build(&input, &directory.join("build").join("data.win"), "Default");
-            };
-            let output = required_path(&mut args, "output data.win path")?;
-            let config = args
-                .next()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Default".to_owned());
-            ensure_no_more_args(args)?;
-            build(&input, &output, &config)
-        }
-        Some("run") => {
-            ensure_no_more_args(args)?;
-            run_current_project(&env::current_dir()?)
-        }
-        Some("clean") => {
-            ensure_no_more_args(args)?;
-            let directory = env::current_dir()?;
-            find_project_in(&directory)?;
-            clean_project_build(&directory)
-        }
-        Some("check-gml") => {
-            let input = required_path(&mut args, "project.gmx path")?;
-            let config = args
-                .next()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Default".to_owned());
-            ensure_no_more_args(args)?;
-            check_gml(&input, &config)
-        }
-        Some("check-vm") => {
-            let input = required_path(&mut args, "project.gmx path")?;
-            let config = args
-                .next()
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Default".to_owned());
-            ensure_no_more_args(args)?;
-            check_vm(&input, &config)
-        }
-        Some("diff") => {
-            let expected = required_path(&mut args, "expected data.win path")?;
-            let actual = required_path(&mut args, "actual data.win path")?;
-            ensure_no_more_args(args)?;
-            diff(&expected, &actual)
-        }
-        Some("diff-semantic") => {
-            let expected = required_path(&mut args, "expected data.win path")?;
-            let actual = required_path(&mut args, "actual data.win path")?;
-            ensure_no_more_args(args)?;
-            diff_semantic(&expected, &actual)
-        }
-        Some(command) => Err(AppError::Usage(format!("unknown command {command:?}"))),
-        None => Err(AppError::Usage("command must be valid Unicode".to_owned())),
     }
-}
-
-fn inspect(path: &Path) -> Result<(), AppError> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let wad = WadFile::read(&mut reader)?;
-
-    println!("file:       {}", path.display());
-    println!("file size:  {} bytes", wad.file_size);
-    println!("FORM size:  {} bytes", wad.form_size);
-    println!("chunks:     {}", wad.chunks.len());
-    if wad.trailing_size() != 0 {
-        println!("trailing:   {} bytes", wad.trailing_size());
-    }
-
-    println!();
-    println!("  #  name  header offset    data offset      size       end");
-    for (index, chunk) in wad.chunks.iter().enumerate() {
-        println!(
-            "{index:>3}  {:<4}  {:#014x}  {:#014x}  {:>10}  {:#014x}",
-            chunk.name,
-            chunk.header_offset,
-            chunk.data_offset,
-            chunk.size,
-            chunk.end_offset(),
-        );
-    }
-
-    Ok(())
-}
-
-fn extract(input: &Path, output: &Path) -> Result<(), AppError> {
-    let file = File::open(input)?;
-    let mut reader = BufReader::new(file);
-    let wad = WadFile::read(&mut reader)?;
-    let paths = extract_chunks(&mut reader, &wad, output)?;
-
-    println!("extracted {} chunks to {}", paths.len(), output.display());
-    for path in paths {
-        println!("{}", path.display());
-    }
-    Ok(())
 }
 
 fn build(input: &Path, output: &Path, config_name: &str) -> Result<(), AppError> {
@@ -181,7 +140,9 @@ fn build(input: &Path, output: &Path, config_name: &str) -> Result<(), AppError>
     let project = ProjectManifest::load(input)?;
     let runner_path = find_external_runner()?;
     let runner = external_runner_file(&runner_path, &project.name)?;
-    let cache = BuildCache::from_env(input, config_name);
+    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
+    let cache_root = cache_root_for_target(output_dir);
+    let cache = BuildCache::from_env_at(input, config_name, &cache_root);
     let known_build = if let Some(cache) = &cache {
         match cache.known_build_if_unchanged() {
             Ok(Some(known)) => {
@@ -243,17 +204,17 @@ fn build(input: &Path, output: &Path, config_name: &str) -> Result<(), AppError>
     }
     let file = File::create(output)?;
     let mut writer = BufWriter::new(file);
-    let mut built = write_vm_wad_with_artifacts(
+    let mut built = write_vm_wad_with_artifacts_in(
         &project,
         &assets,
         &BuildOptions::default(),
         &compiled,
+        &cache_root,
         &mut writer,
     )?;
     writer.flush()?;
     built.external_files.push(runner);
     built.external_files = merge_generated_files(std::mem::take(&mut built.external_files))?;
-    let output_dir = output.parent().unwrap_or_else(|| Path::new("."));
     let output_name = output.file_name().unwrap_or_default().to_string_lossy();
     for artifact in &built.external_files {
         if artifact.path.components().count() == 1
@@ -315,13 +276,11 @@ fn restore_cached_build(cache: &BuildCache, key: &str, output: &Path, started: I
 }
 
 #[cfg(windows)]
-fn run_current_project(project_directory: &Path) -> Result<(), AppError> {
-    let input = find_project_in(project_directory)?;
-    let project = ProjectManifest::load(&input)?;
-    let build_directory = project_directory.join("build");
-    build(&input, &build_directory.join("data.win"), "Default")?;
+fn run_project(input: &Path, build_directory: &Path, config_name: &str) -> Result<(), AppError> {
+    let project = ProjectManifest::load(input)?;
+    build(input, &build_directory.join("data.win"), config_name)?;
 
-    let executable = runner_executable_path(&build_directory, &project.name);
+    let executable = runner_executable_path(build_directory, &project.name);
     if !executable.is_file() {
         return Err(AppError::Message(format!(
             "built Runner executable is missing: {}",
@@ -331,7 +290,7 @@ fn run_current_project(project_directory: &Path) -> Result<(), AppError> {
 
     println!("running {}", executable.display());
     let status = Command::new(&executable)
-        .current_dir(&build_directory)
+        .current_dir(build_directory)
         .status()
         .map_err(|error| {
             AppError::Message(format!(
@@ -349,7 +308,7 @@ fn run_current_project(project_directory: &Path) -> Result<(), AppError> {
 }
 
 #[cfg(not(windows))]
-fn run_current_project(_project_directory: &Path) -> Result<(), AppError> {
+fn run_project(_input: &Path, _build_directory: &Path, _config_name: &str) -> Result<(), AppError> {
     Err(AppError::Message(
         "gmx run requires Windows because the GMS 1.4 Runner is a Windows executable".to_owned(),
     ))
@@ -414,68 +373,7 @@ fn format_diagnostics<T: std::fmt::Display>(heading: &str, errors: &[T]) -> Stri
     message
 }
 
-fn diff(expected: &Path, actual: &Path) -> Result<(), AppError> {
-    let mut expected_reader = BufReader::new(File::open(expected)?);
-    let mut actual_reader = BufReader::new(File::open(actual)?);
-    let difference = diff_wads(&mut expected_reader, &mut actual_reader)?;
-    println!("expected: {}", expected.display());
-    println!("actual:   {}", actual.display());
-    if difference.is_identical() {
-        println!("identical");
-        return Ok(());
-    }
-    print_diff(&difference);
-    Err(AppError::Message("WAD files differ".to_owned()))
-}
-
-fn diff_semantic(expected: &Path, actual: &Path) -> Result<(), AppError> {
-    let mut expected_reader = BufReader::new(File::open(expected)?);
-    let mut actual_reader = BufReader::new(File::open(actual)?);
-    let difference = diff_wads_semantic(&mut expected_reader, &mut actual_reader)?;
-    println!("expected: {}", expected.display());
-    println!("actual:   {}", actual.display());
-    if difference.is_equivalent() {
-        println!("semantically equivalent");
-        return Ok(());
-    }
-    for message in &difference.differences {
-        println!("{message}");
-    }
-    Err(AppError::Message(
-        "WAD files differ semantically".to_owned(),
-    ))
-}
-
-fn check_gml(input: &Path, config_name: &str) -> Result<(), AppError> {
-    let project = ProjectManifest::load(input)?;
-    let config = Config::load_from_project(&project, config_name)?;
-    let assets = Assets::load(&project, &config)?;
-    match analyze_assets(&assets) {
-        Ok(analysis) => {
-            let summary = analysis.summary;
-            println!(
-                "checked {} code units, {} tokens, {} statements",
-                summary.syntax.units, summary.syntax.tokens, summary.syntax.statements
-            );
-            println!(
-                "resolved {} name uses against {} symbols ({} locals, {} globalvar declarations)",
-                summary.names, summary.symbols, summary.locals, summary.global_variables
-            );
-            Ok(())
-        }
-        Err(errors) => {
-            for error in &errors {
-                eprintln!("{error}");
-            }
-            Err(AppError::Message(format!(
-                "GML analysis failed with {} diagnostics",
-                errors.len()
-            )))
-        }
-    }
-}
-
-fn check_vm(input: &Path, config_name: &str) -> Result<(), AppError> {
+fn check_project(input: &Path, config_name: &str) -> Result<(), AppError> {
     let project = ProjectManifest::load(input)?;
     let config = Config::load_from_project(&project, config_name)?;
     let assets = Assets::load(&project, &config)?;
@@ -513,303 +411,47 @@ fn check_vm(input: &Path, config_name: &str) -> Result<(), AppError> {
     }
 }
 
-fn print_diff(diff: &WadDiff) {
-    if let Some(value) = &diff.form_size {
-        println!(
-            "FORM.size: expected {}, actual {}",
-            value.expected, value.actual
-        );
-    }
-    if let Some(value) = &diff.file_size {
-        println!(
-            "file.size: expected {}, actual {}",
-            value.expected, value.actual
-        );
-    }
-    if let Some(value) = &diff.trailing_size {
-        println!(
-            "FORM.trailing: expected {}, actual {}",
-            value.expected, value.actual
-        );
-    }
-    if let Some(value) = &diff.chunk_order {
-        let names = |chunks: &[gmx_rs::wad::FourCc]| {
-            chunks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        println!("chunks.order expected: {}", names(&value.expected));
-        println!("chunks.order actual:   {}", names(&value.actual));
-    }
-    for chunk in &diff.chunks {
-        let suffix = if chunk.occurrence == 0 {
-            String::new()
-        } else {
-            format!("[{}]", chunk.occurrence)
-        };
-        match (chunk.expected_index, chunk.actual_index) {
-            (Some(expected), None) => {
-                println!(
-                    "chunk {}{suffix}: missing (expected index {expected})",
-                    chunk.name
-                );
-                continue;
-            }
-            (None, Some(actual)) => {
-                println!(
-                    "chunk {}{suffix}: unexpected (actual index {actual})",
-                    chunk.name
-                );
-                continue;
-            }
-            (Some(expected), Some(actual)) if expected != actual => println!(
-                "chunk {}{suffix}.index: expected {expected}, actual {actual}",
-                chunk.name
-            ),
-            _ => {}
-        }
-        if let Some(value) = &chunk.header_offset {
-            println!(
-                "chunk {}{suffix}.header_offset: expected {:#x}, actual {:#x}",
-                chunk.name, value.expected, value.actual
-            );
-        }
-        if let Some(value) = &chunk.data_offset {
-            println!(
-                "chunk {}{suffix}.data_offset: expected {:#x}, actual {:#x}",
-                chunk.name, value.expected, value.actual
-            );
-        }
-        if let Some(value) = &chunk.size {
-            println!(
-                "chunk {}{suffix}.size: expected {}, actual {}",
-                chunk.name, value.expected, value.actual
-            );
-        }
-        if let Some(payload) = chunk.payload {
-            println!(
-                "chunk {}{suffix}.payload: first difference +{:#x}, {} differing bytes",
-                chunk.name, payload.first_offset, payload.differing_bytes
-            );
-        }
-    }
-}
-
-fn inspect_project(path: &Path, config_name: &str) -> Result<(), AppError> {
-    let project = ProjectManifest::load(path)?;
-    let config = Config::load_from_project(&project, config_name)?;
-    let assets = Assets::load(&project, &config)?;
-
-    println!("project:     {}", project.name);
-    println!("file:        {}", project.project_file.display());
-    println!("root:        {}", project.root_dir.display());
-    println!("resources:   {}", project.resources.len());
-    for kind in ResourceKind::ALL {
-        let count = project.resource_count(kind);
-        if count != 0 {
-            println!("  {kind:<10} {count:>6}");
-        }
-    }
-    println!("data files:  {}", project.data_files.len());
-    println!("constants:   {}", project.constants.len());
-    println!("audio groups:{}", project.audio_groups.len());
-    println!("config:      {}", config.name);
-    println!("options:     {}", config.options().len());
-    println!("config const:{}", config.constants().len());
-    println!("merged const:{}", assets.settings.constants.len());
-    println!("audio model: {} groups", assets.settings.audio_groups.len());
-    println!(
-        "binary data: {} files, {} bytes",
-        assets.binary_files.len(),
-        assets
-            .binary_files
-            .iter()
-            .map(|file| file.data.len() as u64)
-            .sum::<u64>()
-    );
-    let extension_file_count = assets
-        .extensions
-        .iter()
-        .map(|extension| extension.files.len())
-        .sum::<usize>();
-    let extension_function_count = assets
-        .extensions
-        .iter()
-        .flat_map(|extension| &extension.files)
-        .map(|file| file.functions.len())
-        .sum::<usize>();
-    let extension_constant_count = assets
-        .extensions
-        .iter()
-        .flat_map(|extension| &extension.files)
-        .map(|file| file.constants.len())
-        .sum::<usize>();
-    println!(
-        "extensions:  {} loaded, {extension_file_count} files, {extension_function_count} functions, {extension_constant_count} constants",
-        assets.extensions.len()
-    );
-    println!("ext func ID: next {}", assets.next_extension_function_id);
-    println!("sounds:      {} loaded", assets.sounds.len());
-    println!(
-        "sprites:     {} loaded, {} frames",
-        assets.sprites.len(),
-        assets
-            .sprites
-            .iter()
-            .map(|sprite| sprite.frames.len())
-            .sum::<usize>()
-    );
-    println!("backgrounds: {} loaded", assets.backgrounds.len());
-    println!("paths:       {} loaded", assets.paths.len());
-    println!("scripts:     {} loaded", assets.scripts.len());
-    println!("shaders:     {} loaded", assets.shaders.len());
-    println!("fonts:       {} loaded", assets.fonts.len());
-    println!("timelines:   {} loaded", assets.timelines.len());
-    let object_event_count = assets
-        .objects
-        .iter()
-        .flat_map(|object| &object.events)
-        .map(Vec::len)
-        .sum::<usize>();
-    let object_action_count = assets
-        .objects
-        .iter()
-        .flat_map(|object| &object.events)
-        .flatten()
-        .map(|event| event.actions.len())
-        .sum::<usize>();
-    println!(
-        "objects:     {} loaded, {object_event_count} events, {object_action_count} actions",
-        assets.objects.len()
-    );
-    let room_instance_count = assets
-        .rooms
-        .iter()
-        .map(|room| room.instances.len())
-        .sum::<usize>();
-    let room_tile_count = assets
-        .rooms
-        .iter()
-        .map(|room| room.tiles.len())
-        .sum::<usize>();
-    println!(
-        "rooms:       {} loaded, {room_instance_count} instances, {room_tile_count} tiles",
-        assets.rooms.len()
-    );
-    println!(
-        "room IDs:    next instance {}, next tile {}",
-        assets.next_room_instance_id, assets.next_room_tile_id
-    );
-    if let Some(game_id) = config.option("option_gameid") {
-        println!("game ID:     {game_id}");
-    }
-    if let Some(game_guid) = config.option("option_gameguid") {
-        println!("game GUID:   {game_guid}");
-    }
-
-    let missing_resources: Vec<_> = project
-        .resources
-        .iter()
-        .filter(|resource| !resource.source.is_file())
-        .collect();
-    let missing_data_files: Vec<_> = project
-        .data_files
-        .iter()
-        .filter(|data_file| data_file.exists && !data_file.source.is_file())
-        .collect();
-    let mut missing_asset_sources = Vec::new();
-    for extension in &assets.extensions {
-        for file in &extension.files {
-            if !file.source.is_file() {
-                missing_asset_sources.push((
-                    format!("extension file {}/{}", extension.name, file.filename),
-                    &file.source,
-                ));
-            }
-        }
-    }
-    for sound in &assets.sounds {
-        if !sound.audio_source.is_file() {
-            missing_asset_sources.push((format!("sound data {}", sound.name), &sound.audio_source));
-        }
-    }
-    for sprite in &assets.sprites {
-        for frame in &sprite.frames {
-            if !frame.source.is_file() {
-                missing_asset_sources.push((
-                    format!("sprite frame {}[{}]", sprite.name, frame.index),
-                    &frame.source,
-                ));
-            }
-        }
-        if let Some(source) = sprite
-            .swf_source
-            .as_ref()
-            .filter(|source| !source.is_file())
-        {
-            missing_asset_sources.push((format!("sprite SWF {}", sprite.name), source));
-        }
-        if let Some(source) = sprite
-            .spine_source
-            .as_ref()
-            .filter(|source| !source.is_file())
-        {
-            missing_asset_sources.push((format!("sprite Spine {}", sprite.name), source));
-        }
-    }
-    for background in &assets.backgrounds {
-        if !background.image_source.is_file() {
-            missing_asset_sources.push((
-                format!("background data {}", background.name),
-                &background.image_source,
-            ));
-        }
-    }
-    for font in &assets.fonts {
-        if !font.image_source.is_file() {
-            missing_asset_sources.push((format!("font bitmap {}", font.name), &font.image_source));
-        }
-    }
-    let missing_count =
-        missing_resources.len() + missing_data_files.len() + missing_asset_sources.len();
-    println!("missing:     {missing_count}");
-
-    for resource in missing_resources {
-        println!(
-            "  {} {}: {}",
-            resource.kind,
-            resource.name,
-            resource.source.display()
-        );
-    }
-    for data_file in missing_data_files {
-        println!(
-            "  datafile {}: {}",
-            data_file.name,
-            data_file.source.display()
-        );
-    }
-    for (label, path) in missing_asset_sources {
-        println!("  {label}: {}", path.display());
-    }
-
-    if missing_count != 0 {
+fn resolve_manifest(manifest_path: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    let current_directory = env::current_dir()?;
+    let manifest = strip_current_directory_components(match manifest_path {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => current_directory.join(path),
+        None => find_project_in(&current_directory)?,
+    });
+    if !manifest.is_file() {
         return Err(AppError::Message(format!(
-            "project references {missing_count} missing files"
+            "project manifest does not exist or is not a file: {}",
+            manifest.display()
         )));
     }
-    Ok(())
+    Ok(manifest)
 }
 
-fn required_path(
-    args: &mut impl Iterator<Item = OsString>,
-    description: &str,
+fn resolve_target_dir(
+    manifest: &Path,
+    target_directory: Option<PathBuf>,
 ) -> Result<PathBuf, AppError> {
-    args.next()
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::Usage(format!("missing {description}")))
+    let current_directory = env::current_dir()?;
+    let target = target_directory.unwrap_or_else(|| {
+        manifest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("build")
+    });
+    Ok(strip_current_directory_components(
+        if target.is_absolute() {
+            target
+        } else {
+            current_directory.join(target)
+        },
+    ))
+}
+
+fn strip_current_directory_components(path: PathBuf) -> PathBuf {
+    path.components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect()
 }
 
 fn find_project_in(directory: &Path) -> Result<PathBuf, AppError> {
@@ -851,12 +493,14 @@ fn find_project_in(directory: &Path) -> Result<PathBuf, AppError> {
     }
 }
 
-fn clean_project_build(project_directory: &Path) -> Result<(), AppError> {
-    let build = project_directory.join("build");
-    let metadata = match fs::symlink_metadata(&build) {
+fn clean_project_build(project_directory: &Path, build_directory: &Path) -> Result<(), AppError> {
+    let metadata = match fs::symlink_metadata(build_directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!("no build artifacts to remove: {}", build.display());
+            println!(
+                "no build artifacts to remove: {}",
+                build_directory.display()
+            );
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -864,31 +508,34 @@ fn clean_project_build(project_directory: &Path) -> Result<(), AppError> {
     if is_link_or_reparse_point(&metadata) {
         return Err(AppError::Message(format!(
             "refusing to clean linked build directory {}",
-            build.display()
+            build_directory.display()
         )));
     }
     if !metadata.is_dir() {
         return Err(AppError::Message(format!(
             "refusing to clean non-directory build path {}",
-            build.display()
+            build_directory.display()
         )));
     }
 
     let project_directory = fs::canonicalize(project_directory)?;
-    let resolved = fs::canonicalize(&build)?;
-    if resolved.parent() != Some(project_directory.as_path()) {
+    let resolved = fs::canonicalize(build_directory)?;
+    if resolved.parent().is_none()
+        || resolved == project_directory
+        || project_directory.starts_with(&resolved)
+    {
         return Err(AppError::Message(format!(
-            "refusing to clean build directory outside project root: {}",
+            "refusing to clean unsafe build directory: {}",
             resolved.display()
         )));
     }
-    fs::remove_dir_all(&build).map_err(|error| {
+    fs::remove_dir_all(&resolved).map_err(|error| {
         AppError::Message(format!(
             "cannot remove build artifacts {}: {error}",
-            build.display()
+            resolved.display()
         ))
     })?;
-    println!("removed build artifacts: {}", build.display());
+    println!("removed build artifacts: {}", build_directory.display());
     Ok(())
 }
 
@@ -910,50 +557,8 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn ensure_no_more_args(mut args: impl Iterator<Item = OsString>) -> Result<(), AppError> {
-    match args.next() {
-        Some(argument) => Err(AppError::Usage(format!(
-            "unexpected argument {:?}",
-            argument.to_string_lossy()
-        ))),
-        None => Ok(()),
-    }
-}
-
-fn print_usage() {
-    println!(
-        "gmx - GameMaker Studio 1.4 project compiler\n\n\
-         Usage:\n  \
-            gmx build\n  \
-            gmx run\n  \
-            gmx clean\n  \
-            gmx inspect <data.win>\n  \
-            gmx extract <data.win> <output-directory>\n  \
-            gmx inspect-project <project.gmx> [config]\n  \
-            gmx check-gml <project.gmx> [config]\n  \
-            gmx check-vm <project.gmx> [config]\n  \
-            gmx build <project.gmx> <data.win> [config]\n  \
-            gmx diff <expected-data.win> <actual-data.win>\n  \
-            gmx diff-semantic <expected-data.win> <actual-data.win>\n  \
-            gmx help\n\n\
-         Commands:\n  \
-           inspect   validate and list the chunks in a data.win file\n  \
-           extract   copy each raw chunk payload to a separate file\n  \
-           inspect-project  list and validate resources in a GMX project\n  \
-           check-gml  parse every GML code unit in a GMX project\n  \
-           check-vm   compile every GML code unit to GMS 1.4 VM bytecode\n  \
-           build     auto-detect ./*.project.gmx and write ./build/data.win,\n  \
-                     or compile explicit input/output paths; Runner.exe must\n+                     be next to the gmx executable\n  \
-           run       build the current project and run ./build/<project>.exe\n  \
-           clean     remove the current project's ./build directory, including cache\n  \
-           diff      compare exact WAD structure and chunk payloads\n  \
-           diff-semantic  compare VM links, texture pixels, and audio semantics"
-    );
-}
-
 #[derive(Debug)]
 enum AppError {
-    Usage(String),
     Runtime(Box<dyn Error>),
     Message(String),
 }
@@ -973,8 +578,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use clap::Parser;
+
     use super::{
-        AppError, external_runner_file, find_project_in, runner_executable_path,
+        AppError, Cli, CliCommand, external_runner_file, find_project_in, runner_executable_path,
         runner_path_next_to,
     };
 
@@ -1004,6 +611,56 @@ mod tests {
         let error = find_project_in(&directory.path).unwrap_err();
         assert!(
             matches!(error, AppError::Message(message) if message.ends_with("A.project.gmx, B.project.gmx"))
+        );
+    }
+
+    #[test]
+    fn parses_cargo_style_build_options() {
+        let cli = Cli::try_parse_from([
+            "gmx",
+            "build",
+            "--manifest-path",
+            "Game.project.gmx",
+            "--target-dir",
+            "artifacts",
+            "--config",
+            "Release",
+        ])
+        .unwrap();
+
+        let Some(CliCommand::Build(args)) = cli.command else {
+            panic!("expected build command");
+        };
+        assert_eq!(
+            args.project.manifest.manifest_path,
+            Some(PathBuf::from("Game.project.gmx"))
+        );
+        assert_eq!(args.target_dir, Some(PathBuf::from("artifacts")));
+        assert_eq!(args.project.config, "Release");
+    }
+
+    #[test]
+    fn rejects_removed_diagnostic_commands_and_aliases() {
+        for command in [
+            "check-vm",
+            "check-gml",
+            "inspect",
+            "extract",
+            "inspect-project",
+            "diff",
+            "diff-semantic",
+        ] {
+            assert!(
+                Cli::try_parse_from(["gmx", command]).is_err(),
+                "{command} should not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_legacy_build_positionals() {
+        assert!(
+            Cli::try_parse_from(["gmx", "build", "Game.project.gmx", "build/data.win"]).is_err()
         );
     }
 
@@ -1058,11 +715,11 @@ mod tests {
         fs::write(build.join("data.win"), b"artifact").unwrap();
         fs::write(build.join(".gmx-cache/build/complete"), b"cache").unwrap();
 
-        super::clean_project_build(&directory.path).unwrap();
+        super::clean_project_build(&directory.path, &build).unwrap();
 
         assert!(!build.exists());
         assert!(project.is_file());
-        super::clean_project_build(&directory.path).unwrap();
+        super::clean_project_build(&directory.path, &build).unwrap();
     }
 
     #[test]
@@ -1071,7 +728,7 @@ mod tests {
         let build = directory.path.join("build");
         fs::write(&build, b"not a directory").unwrap();
 
-        let error = super::clean_project_build(&directory.path).unwrap_err();
+        let error = super::clean_project_build(&directory.path, &build).unwrap_err();
 
         assert!(matches!(error, AppError::Message(message) if message.contains("non-directory")));
         assert!(build.is_file());

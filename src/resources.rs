@@ -1105,7 +1105,7 @@ fn font_from_node(resource: &ResourceRef, root: &Node) -> Result<Font, ResourceE
 
     if let Some(pairs) = root.child("kerningPairs") {
         for pair in pairs.children_named("pair") {
-            let first =
+            let first: i32 =
                 attribute_number(pair, "first", "kerningPairs.pair.first", &resource.source)?;
             let other =
                 attribute_number(pair, "second", "kerningPairs.pair.second", &resource.source)?;
