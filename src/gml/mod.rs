@@ -4,6 +4,7 @@ mod chunks;
 mod classifications;
 mod codegen;
 mod compiler_constants;
+mod compiler_functions;
 mod dnd;
 mod lexer;
 mod macros;

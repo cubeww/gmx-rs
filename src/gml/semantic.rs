@@ -88,7 +88,7 @@ pub struct Symbols {
 impl Symbols {
     pub fn from_assets(assets: &Assets) -> Self {
         let mut symbols = Self::new();
-        for name in builtins::FUNCTIONS.lines() {
+        for name in builtins::function_names() {
             let id = symbols.intern(name);
             symbols.info[id.0 as usize].callable = Some(CallableSymbol::BuiltinFunction);
         }
@@ -1200,19 +1200,12 @@ mod tests {
 
     #[test]
     fn runner_tables_have_expected_entries() {
-        assert_eq!(builtins::FUNCTIONS.lines().count(), 2733);
+        assert_eq!(builtins::function_names().count(), 2757);
         assert_eq!(builtins::constant_names().count(), 870);
         assert_eq!(builtins::VARIABLES.lines().count(), 212);
-        assert!(
-            builtins::FUNCTIONS
-                .lines()
-                .any(|name| name == "instance_create")
-        );
-        assert!(
-            builtins::FUNCTIONS
-                .lines()
-                .any(|name| name == "audio_play_sound")
-        );
+        assert!(builtins::function_names().any(|name| name == "instance_create"));
+        assert!(builtins::function_names().any(|name| name == "audio_play_sound"));
+        assert!(builtins::function_names().any(|name| name == "sprite_save_strip"));
         assert!(builtins::constant_names().any(|name| name == "c_red"));
         assert!(builtins::constant_names().any(|name| name == "vbm_fast"));
         assert!(builtins::VARIABLES.lines().any(|name| name == "room_speed"));

@@ -2738,6 +2738,10 @@ yyg_player_run
 zip_unzip
 ";
 
+pub fn function_names() -> impl Iterator<Item = &'static str> {
+    FUNCTIONS.lines().chain(super::compiler_functions::names())
+}
+
 pub const CONSTANTS: &str = "\
 all
 audio_3d
@@ -4123,6 +4127,14 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn function_registry_has_unique_names() {
+        let names = function_names().collect::<Vec<_>>();
+        let unique = names.iter().copied().collect::<HashSet<_>>();
+
+        assert_eq!(names.len(), unique.len());
+    }
 
     #[test]
     fn constant_registry_has_unique_names_and_values() {

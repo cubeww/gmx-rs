@@ -2792,6 +2792,22 @@ mod tests {
     }
 
     #[test]
+    fn compiles_official_compiler_supplementary_functions() {
+        let compiled = compile_source(
+            "vm-compiler-functions",
+            "sprite_save_strip(0, \"strip.png\");",
+        );
+
+        assert!(
+            compiled.codes[0]
+                .bytecode
+                .function_references
+                .iter()
+                .any(|reference| reference.name == "sprite_save_strip")
+        );
+    }
+
+    #[test]
     fn preserves_prefix_and_postfix_results_for_stack_addressed_increments() {
         let cases = [
             ("vm-array-post-inc", "return a[0]++;", 5, Opcode::Add, false),
