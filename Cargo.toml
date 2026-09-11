@@ -11,12 +11,10 @@ path = "src/main.rs"
 clap = { version = "4.5.48", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 md-5 = "0.10.6"
-ogg = "0.9.2"
-oxideav-vorbis = "0.0.12"
 quick-xml = { version = "0.41.0", features = ["encoding"] }
 rayon = "1.12.0"
 rubato = "5.0.0"
 rusty_mp3 = "0.7.0"
-rusty_vorbis = "0.1.1"
 symphonia = { version = "0.6.1", default-features = false, features = ["adpcm", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+vorbis_rs = { version = "0.5.6", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -17,7 +17,8 @@ use crate::wad::{ChunkOptions, ChunkWriter, FourCc, WadBuilder, WriteError};
 mod codec;
 
 const AUDO: FourCc = FourCc::new(*b"AUDO");
-const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-rust-v4\0";
+const AUDIO_CACHE_SCHEMA: &[u8] = b"gmx-rs-audio-cache-libvorbis\0";
+const MAX_AUDIO_TRANSCODE_THREADS: usize = 4;
 const OGG_CRC_TABLE: [u32; 256] = ogg_crc_table();
 
 #[derive(Debug, Clone)]
@@ -61,19 +62,27 @@ impl AudioData {
             });
         }
 
-        let converted = assets
-            .sounds
-            .par_iter()
-            .map(|sound| convert_sound(assets, sound, cache_root))
-            .collect::<Result<Vec<_>, _>>()
+        let audio_threads = rayon::current_num_threads().min(MAX_AUDIO_TRANSCODE_THREADS);
+        let audio_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(audio_threads)
+            .build()
+            .map_err(|error| invalid_audio(format!("could not start audio workers: {error}")))?;
+        let converted = audio_pool
+            .install(|| {
+                assets
+                    .sounds
+                    .par_iter()
+                    .map(|sound| convert_sound(assets, sound, cache_root))
+                    .collect::<Result<Vec<_>, _>>()
+            })
             .map_err(|error| invalid_audio(error.to_string()))?;
 
         let mut grouped = (0..group_count)
             .map(|_| Vec::<(String, Arc<[u8]>)>::new())
             .collect::<Vec<_>>();
         let mut streamed = Vec::new();
-        for (sound, media) in assets.sounds.iter().zip(&sounds) {
-            let data = Arc::<[u8]>::from(converted[sound.index].clone());
+        for ((sound, media), data) in assets.sounds.iter().zip(&sounds).zip(converted) {
+            let data = Arc::<[u8]>::from(data);
             if sound.streamed {
                 streamed.push(GeneratedFile::new(
                     PathBuf::from(&media.filename),

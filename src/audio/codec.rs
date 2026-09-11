@@ -1,24 +1,22 @@
 use std::io::Cursor;
+use std::num::{NonZeroU8, NonZeroU32};
 use std::path::Path;
 
-use ogg::writing::{PacketWriteEndInfo, PacketWriter};
-use oxideav_vorbis::{StreamEncoderConfig, encode_pcm_to_ogg};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use rusty_mp3::{Error as Mp3Error, Mp3Encoder, Mp3EncoderConfig};
-use rusty_vorbis::{Error as VorbisError, VorbisEncoder, VorbisEncoderConfig};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use vorbis_rs::{VorbisBitrateManagementStrategy, VorbisEncoderBuilder};
 
 use super::AudioFormat;
 
 const RESAMPLE_CHUNK_FRAMES: usize = 1024;
-// rusty_vorbis 0.1 uses a fixed 2048-frame profile with 50% overlap.
-const PROFILED_VORBIS_HOP_FRAMES: usize = 1024;
+const VORBIS_BLOCK_FRAMES: usize = 1024;
 
 pub(super) struct TranscodeSettings {
     pub(super) format: AudioFormat,
@@ -345,126 +343,49 @@ fn encode_ogg(
     bit_rate: u32,
     serial: u32,
 ) -> Result<Vec<u8>, String> {
-    if channels == 2 {
-        match encode_profiled_ogg(samples, channels, sample_rate, bit_rate, serial) {
-            Ok(output) => return Ok(output),
-            Err(fast_error) => {
-                return encode_general_ogg(samples, channels, sample_rate, bit_rate, serial)
-                    .map_err(|fallback_error| {
-                        format!("{fast_error}; fallback encoder failed: {fallback_error}")
-                    });
+    let sample_rate = NonZeroU32::new(sample_rate)
+        .ok_or_else(|| "the Vorbis sample rate must be greater than zero".to_owned())?;
+    let channels_u8 = u8::try_from(channels)
+        .ok()
+        .and_then(NonZeroU8::new)
+        .ok_or_else(|| "invalid Vorbis channel count".to_owned())?;
+    let mut builder =
+        VorbisEncoderBuilder::new_with_serial(sample_rate, channels_u8, Vec::new(), serial as i32);
+    builder.bitrate_management_strategy(VorbisBitrateManagementStrategy::QualityVbr {
+        target_quality: vorbis_quality(bit_rate),
+    });
+    let mut encoder = builder
+        .build()
+        .map_err(|error| format!("could not configure Vorbis encoding: {error}"))?;
+
+    // libvorbis is designed for streaming blocks. Passing an entire multi-minute
+    // sound as one block causes excessive memory use and can be orders of
+    // magnitude slower, so keep only a small planar block alive at a time.
+    let mut planar = (0..channels)
+        .map(|_| Vec::with_capacity(VORBIS_BLOCK_FRAMES))
+        .collect::<Vec<_>>();
+    for block in samples.chunks(VORBIS_BLOCK_FRAMES * channels) {
+        for channel in &mut planar {
+            channel.clear();
+        }
+        for frame in block.chunks_exact(channels) {
+            for (channel, sample) in frame.iter().enumerate() {
+                planar[channel].push(finite_sample(*sample));
             }
         }
+        encoder
+            .encode_audio_block(planar.as_slice())
+            .map_err(|error| format!("Vorbis encoding failed: {error}"))?;
     }
-    encode_general_ogg(samples, channels, sample_rate, bit_rate, serial)
-}
-
-fn encode_profiled_ogg(
-    samples: &[f32],
-    channels: usize,
-    sample_rate: u32,
-    bit_rate: u32,
-    serial: u32,
-) -> Result<Vec<u8>, String> {
-    let bitrate_bps = bit_rate
-        .checked_mul(1000)
-        .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| "Vorbis bitrate is too large".to_owned())?;
-    let mut encoder = VorbisEncoder::new(VorbisEncoderConfig {
-        bitrate_bps,
-        quality: vorbis_quality(bit_rate),
-    });
-    let channels_u16 =
-        u16::try_from(channels).map_err(|_| "too many Vorbis channels".to_owned())?;
-    // The first Vorbis packet only primes overlap-add. Add one silent hop at
-    // each edge so short effects retain their beginning and end, then expose
-    // granule positions on the original (unpadded) timeline below.
-    let padding = vec![0.0; PROFILED_VORBIS_HOP_FRAMES * channels];
     encoder
-        .push_pcm_f32(&padding, channels_u16, sample_rate)
-        .map_err(|error| format!("Vorbis encoding failed: {error}"))?;
-    encoder
-        .push_pcm_f32(samples, channels_u16, sample_rate)
-        .map_err(|error| format!("Vorbis encoding failed: {error}"))?;
-    encoder
-        .push_pcm_f32(&padding, channels_u16, sample_rate)
-        .map_err(|error| format!("Vorbis encoding failed: {error}"))?;
-    encoder.finish();
-
-    let mut packets = Vec::new();
-    loop {
-        match encoder.next_packet() {
-            Ok(packet) => packets.push(packet),
-            Err(VorbisError::Eof) => break,
-            Err(error) => return Err(format!("Vorbis encoding failed: {error}")),
-        }
-    }
-    if packets.len() < 4 {
-        return Err("Vorbis encoder produced an incomplete stream".to_owned());
-    }
-
-    let packet_count = packets.len();
-    let source_frames = u64::try_from(samples.len() / channels)
-        .map_err(|_| "Vorbis input is too large".to_owned())?;
-    let mut writer = PacketWriter::new(Vec::new());
-    for (index, packet) in packets.into_iter().enumerate() {
-        let end = if index == 0 || index == 2 {
-            PacketWriteEndInfo::EndPage
-        } else if index + 1 == packet_count {
-            PacketWriteEndInfo::EndStream
-        } else {
-            PacketWriteEndInfo::NormalPacket
-        };
-        let granule = u64::try_from(packet.pts)
-            .map_err(|_| "Vorbis encoder produced a negative granule position".to_owned())?;
-        let granule = if index < 3 {
-            granule
-        } else {
-            granule
-                .saturating_sub(PROFILED_VORBIS_HOP_FRAMES as u64)
-                .min(source_frames)
-        };
-        writer
-            .write_packet(packet.data, serial, end, granule)
-            .map_err(|error| format!("Ogg muxing failed: {error}"))?;
-    }
-    Ok(writer.into_inner())
-}
-
-fn encode_general_ogg(
-    samples: &[f32],
-    channels: usize,
-    sample_rate: u32,
-    bit_rate: u32,
-    serial: u32,
-) -> Result<Vec<u8>, String> {
-    let frames = samples.len() / channels;
-    let mut planar = (0..channels)
-        .map(|_| Vec::with_capacity(frames))
-        .collect::<Vec<_>>();
-    for frame in samples.chunks_exact(channels) {
-        for (channel, sample) in frame.iter().enumerate() {
-            planar[channel].push(finite_sample(*sample));
-        }
-    }
-
-    let mut config = StreamEncoderConfig::new(
-        sample_rate,
-        u8::try_from(channels).map_err(|_| "too many Vorbis channels".to_owned())?,
-    );
-    config.quality = vorbis_quality(bit_rate);
-    config.serial = serial;
-    config.training_iterations = 0;
-    encode_pcm_to_ogg(&planar, &config).map_err(|error| format!("Vorbis encoding failed: {error}"))
+        .finish()
+        .map_err(|error| format!("could not finish Vorbis encoding: {error}"))
 }
 
 fn vorbis_quality(bit_rate: u32) -> f32 {
-    // GameMaker's legacy setting advances in 64-kbit/s steps. The pure-Rust
-    // encoders' normalized quality scale is substantially more aggressive
-    // than libvorbis' q scale below about 0.7, so map the useful range onto a
-    // calibrated 0.70..=0.98 interval instead of treating both scales alike.
-    let legacy_step = (bit_rate / 64).min(6) as f32;
-    (0.70 + legacy_step * 0.05).min(0.98)
+    // GameMaker's old FFmpeg invocation used `-aq min(bit_rate / 64, 6)`.
+    // libvorbis exposes the same quality scale normalized from -0.2..=1.0.
+    (bit_rate / 64).min(6) as f32 / 10.0
 }
 
 fn encode_mp3(
@@ -533,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_rust_encoders_produce_decodable_streams() {
+    fn built_in_encoders_produce_decodable_streams() {
         let sample_rate = 44_100;
         let samples = (0..4096)
             .map(|index| {
@@ -597,12 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_bitrate_uses_the_calibrated_vorbis_quality_range() {
-        assert!((vorbis_quality(0) - 0.70).abs() < f32::EPSILON);
-        assert!((vorbis_quality(64) - 0.75).abs() < f32::EPSILON);
-        assert!((vorbis_quality(192) - 0.85).abs() < f32::EPSILON);
-        assert!((vorbis_quality(384) - 0.98).abs() < f32::EPSILON);
-        assert!((vorbis_quality(u32::MAX) - 0.98).abs() < f32::EPSILON);
+    fn legacy_bitrate_uses_the_libvorbis_quality_scale() {
+        assert!((vorbis_quality(0) - 0.0).abs() < f32::EPSILON);
+        assert!((vorbis_quality(64) - 0.1).abs() < f32::EPSILON);
+        assert!((vorbis_quality(192) - 0.3).abs() < f32::EPSILON);
+        assert!((vorbis_quality(384) - 0.6).abs() < f32::EPSILON);
+        assert!((vorbis_quality(u32::MAX) - 0.6).abs() < f32::EPSILON);
     }
 
     #[test]

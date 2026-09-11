@@ -14,3 +14,6 @@ Copy this directory's files next to `gmx.exe` after a release build.
 
 Core Windows DLLs and Microsoft Visual C++ runtimes are system prerequisites
 and are not copied from the development machine into this repository.
+
+`VORBIS_LICENSES.txt` contains the notices for the Vorbis libraries statically
+linked into `gmx.exe`. Keep it with binary distributions of `gmx`.
